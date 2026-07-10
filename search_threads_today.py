@@ -16,16 +16,18 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from websocket import create_connection
 
+from config import E_DATE, MAX_N, SEARCH_WORD, S_DATE
+
 
 BASE_DIR = Path(__file__).resolve().parent
 ENV_FILE = BASE_DIR / ".env"
 DEFAULT_PROFILE_DIR = "chrome_profile"
 DEFAULT_OUTPUT = "threads_search_today.json"
 DEFAULT_URL_TABLE = BASE_DIR / "url_table.xlsx"
-DEFAULT_SEARCH_WORD = "淨漢"
-DEFAULT_S_DATE = datetime.now().astimezone().strftime("%Y%m%d")
-DEFAULT_E_DATE = datetime.now().astimezone().strftime("%Y%m%d")
-DEFAULT_MAX_N = 3
+DEFAULT_SEARCH_WORD = SEARCH_WORD
+DEFAULT_S_DATE = S_DATE
+DEFAULT_E_DATE = E_DATE
+DEFAULT_MAX_N = MAX_N
 
 
 def load_local_env(path: Path = ENV_FILE) -> None:
@@ -42,14 +44,14 @@ def load_local_env(path: Path = ENV_FILE) -> None:
 
 
 def get_search_settings() -> tuple[str, str, str, int]:
-    search_word = os.getenv("SEARCH_WORD", DEFAULT_SEARCH_WORD)
-    s_date = os.getenv("S_DATE", DEFAULT_S_DATE)
-    e_date = os.getenv("E_DATE", DEFAULT_E_DATE)
+    search_word = DEFAULT_SEARCH_WORD
+    s_date = DEFAULT_S_DATE
+    e_date = DEFAULT_E_DATE
 
     try:
-        max_n = int(os.getenv("MAX_N", str(DEFAULT_MAX_N)))
+        max_n = int(DEFAULT_MAX_N)
     except ValueError as error:
-        raise SystemExit("MAX_N in .env must be an integer.") from error
+        raise SystemExit("MAX_N in config.py must be an integer.") from error
 
     return search_word, s_date, e_date, max_n
 
