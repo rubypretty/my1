@@ -1,0 +1,11 @@
+.env
+.venv/
+chrome_profile/
+manual_chrome_profile/
+__pycache__/
+*.pyc
+threads_posts.json
+threads_posts.csv
+threads_posts.xlsx
+threads_search_today.json
+url_table.xlsx
