@@ -1,6 +1,6 @@
 # Threads Selenium Scraper
 
-一個簡單的 Threads 抓文範例，使用 Selenium 開啟瀏覽器、手動登入，然後從指定頁面收集貼文文字與連結。
+用 Selenium 抓取 Threads 貼文頁面的公開文字資料，並輸出成 Excel。
 
 ## 安裝
 
@@ -10,36 +10,32 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-## 使用
+## 使用方式
 
-```powershell
-python threads_scraper.py "https://www.threads.com/@username" --max-posts 20 --output threads_posts.json
-```
-
-輸出 CSV：
-
-```powershell
-python threads_scraper.py "https://www.threads.com/@username" --max-posts 20 --output threads_posts.csv
-```
-
-第一次使用時建議不要加 `--headless`，瀏覽器開啟後可以手動登入 Threads。
-
-## 使用已登入 Chrome
-
-如果 Selenium 開出的瀏覽器一直觸發登入驗證，請改用專用 Chrome：
-
-```powershell
-.\start_debug_chrome.ps1
-```
-
-在開出的 Chrome 完成 Threads 登入後，不要關掉 Chrome，另外執行：
+把要抓取的 Threads URL 放在 `url_table.xlsx`，第一列使用 `url` 欄位，然後執行：
 
 ```powershell
 python threads_scraper.py
 ```
 
-## 注意
+預設會輸出 `threads_posts.xlsx`，包含：
 
+- `author`
+- `post_time`
+- `view_count`
+- `main_text`
+- `engagement`
+- `related_or_replies`
+
+`post_time` 會轉成 `yyyy.mm.dd hh:mm` 格式，例如 `2026.07.10 17:22`。
+
+## 搜尋今日貼文
+
+```powershell
+python search_threads_today.py
+```
+
+## 注意事項
+
+- `.env`、Chrome profile、Excel/JSON 輸入輸出檔都不會提交到 Git。
 - 請遵守 Threads 的服務條款、robots/平台規範與當地法律。
-- 不要抓取非公開、敏感或未經授權的個人資料。
-- 建議降低頻率，避免大量請求造成帳號或 IP 被限制。

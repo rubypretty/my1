@@ -1,11 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+.Python
+*.egg-info/
+build/
+dist/
+
+# Virtual environments and local config
 .env
+.envrc
 .venv/
+env/
+venv/
+ENV/
+
+# Browser profiles / local session data
 chrome_profile/
 manual_chrome_profile/
-__pycache__/
-*.pyc
+
+# Test and tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local scraper inputs and outputs
 threads_posts.json
 threads_posts.csv
 threads_posts.xlsx
 threads_search_today.json
 url_table.xlsx
+
+# Editor / OS noise
+.idea/
+.vscode/
+tempCodeRunnerFile.py
+Thumbs.db
+.DS_Store
