@@ -15,7 +15,7 @@ pip install -r requirements.txt
 把要抓取的 Threads URL 放在 `url_table.xlsx`，第一列使用 `url` 欄位，然後執行：
 
 ```powershell
-python threads_scraper.py
+python search_threads_today.py
 ```
 
 預設會輸出 `threads_posts.xlsx`，包含：
@@ -24,7 +24,10 @@ python threads_scraper.py
 - `post_time`
 - `view_count`
 - `main_text`
-- `engagement`
+- `愛心`
+- `留言`
+- `轉發`
+- `分享`
 - `related_or_replies`
 
 `post_time` 會轉成 `yyyy.mm.dd hh:mm` 格式，例如 `2026.07.10 17:22`。
