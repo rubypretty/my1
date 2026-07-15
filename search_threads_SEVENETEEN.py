@@ -1,35 +1,32 @@
 import argparse
+import os
 import random
+import re
 import sqlite3
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlsplit, urlunsplit
 from urllib.request import urlopen
 
+from selenium import webdriver
 from selenium.common.exceptions import WebDriverException
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium_stealth import stealth
 
-import SEVENETEEN as settings
-from search_threads_today import (
-    build_downloaded_post,
-    build_error_post,
-    is_media_post_url,
-    load_local_env,
-    make_browser_openable_html,
-    normalize_post_url,
-    search_url,
-    start_driver,
-    wait_for_body,
-)
+import SEVENETEEN_SEARCH_WORDS as settings
 
 
 BASE_DIR = Path(__file__).resolve().parent
+ENV_FILE = BASE_DIR / ".env"
 DEFAULT_DB_PATH = BASE_DIR / "seventeen.sqlite3"
 DEFAULT_HTML_DIR = BASE_DIR / "seventeen.html"
 DEFAULT_PROFILE_DIR = "chrome_profile"
-DEFAULT_SEARCH_WORD = getattr(settings, "SEARCH_WORD", "seventeen")
-DEFAULT_SEARCH_WORDS = list(getattr(settings, "SEARCH_WORDS", [DEFAULT_SEARCH_WORD]))
-DEFAULT_MAX_N = int(getattr(settings, "MAX_N", 10))
+DEFAULT_SEARCH_WORDS = list(getattr(settings, "SEARCH_WORDS", ["seventeen"]))
+DEFAULT_SEARCH_WORD = DEFAULT_SEARCH_WORDS[0]
+DEFAULT_MAX_N = int(getattr(settings, "MAX_N", 100000))
 DEFAULT_MAX_IDLE_ROUNDS = int(getattr(settings, "MAX_IDLE_ROUNDS", 24))
 TELEGRAM_BOT_TOKEN = getattr(settings, "telegram_bot_token", "")
 TELEGRAM_CHAT_ID = getattr(settings, "telegram_chat_id", "")
@@ -42,6 +39,11 @@ HTTP_429_ERROR = "這個網頁無法正常運作，HTTP ERROR 429"
 POST_LOAD_RETRIES = 3
 SELENIUM_COMMAND_TIMEOUT_SECONDS = 45
 DRIVER_RESTART_RETRIES = 3
+OUTPUT_TIME_FORMAT = "%Y.%m.%d %H:%M"
+MIN_CHINESE_CHARS = 2
+MIN_CHINESE_RATIO = 0.30
+MAX_KANA_RATIO = 0.20
+EXCLUDE_PHRASES = ("AI 資訊", "尚無回覆", "查看動態")
 
 
 class Http429PageError(RuntimeError):
@@ -50,6 +52,401 @@ class Http429PageError(RuntimeError):
 
 class BrowserRecoveryFailed(RuntimeError):
     pass
+
+
+def load_local_env(path: Path = ENV_FILE) -> None:
+    if not path.exists():
+        return
+
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+def normalize_post_url(url: str) -> str:
+    parts = urlsplit(url.replace("https://www.threads.net/", "https://www.threads.com/"))
+    path = parts.path.rstrip("/")
+    return urlunsplit(("https", "www.threads.com", path, "hl=zh-tw", ""))
+
+
+def is_media_post_url(url: str) -> bool:
+    parts = urlsplit(url.replace("https://www.threads.net/", "https://www.threads.com/"))
+    return parts.path.rstrip("/").endswith("/media")
+
+
+def wait_for_body(driver: webdriver.Chrome, timeout: int = 20) -> str:
+    wait = WebDriverWait(driver, timeout)
+    wait.until(lambda current: current.find_elements(By.TAG_NAME, "body"))
+    wait.until(lambda current: len((current.find_element(By.TAG_NAME, "body").text or "").strip()) > 20)
+    return driver.find_element(By.TAG_NAME, "body").text or ""
+
+
+def normalize_view_count(text: str) -> str:
+    return " ".join(text.replace("\xa0", " ").split())
+
+
+def format_count_number(text: str) -> str:
+    normalized = normalize_view_count(text)
+    match = re.search(r"(\d[\d,]*(?:\.\d+)?)\s*(億|萬|千|k|m|b)?", normalized, flags=re.IGNORECASE)
+    if not match:
+        return normalized
+
+    amount = float(match.group(1).replace(",", ""))
+    unit = (match.group(2) or "").lower()
+    multipliers = {
+        "千": 1_000,
+        "萬": 10_000,
+        "億": 100_000_000,
+        "k": 1_000,
+        "m": 1_000_000,
+        "b": 1_000_000_000,
+    }
+    value = int(round(amount * multipliers.get(unit, 1)))
+    return f"{value:,}"
+
+
+def format_view_count(text: str) -> str:
+    normalized = normalize_view_count(text)
+    return format_count_number(normalized) if looks_like_view_count(normalized) else normalized
+
+
+def looks_like_view_count(text: str) -> bool:
+    normalized = normalize_view_count(text).lower()
+    return bool(normalized) and (
+        "\u6b21\u700f\u89bd" in normalized
+        or "\u700f\u89bd\u6b21\u6578" in normalized
+        or "view" in normalized
+    )
+
+
+def clean_lines(text: str) -> list[str]:
+    stop_markers = [
+        "登入即可查看更多",
+        "登入查看更多 Threads",
+        "© 2026",
+        "Threads 使用條款",
+    ]
+    for marker in stop_markers:
+        if marker in text:
+            text = text.split(marker, 1)[0].strip()
+
+    noise_lines = {"登入", "註冊", "搜尋", "Threads"}
+    lines = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line in noise_lines:
+            continue
+        lines.append(line)
+    return lines
+
+
+def extract_author_from_url(url: str) -> str:
+    match = re.search(r"/@([^/?#]+)/post/", url)
+    return match.group(1) if match else ""
+
+
+def looks_like_metric(line: str) -> bool:
+    return bool(re.fullmatch(r"\d[\d,]*", line))
+
+
+def looks_like_time(line: str) -> bool:
+    if re.fullmatch(r"\d+\s*(秒|分鐘|小時|天|週|月|年|s|m|h|sec|min|hr|d|w)", line, flags=re.IGNORECASE):
+        return True
+    if re.fullmatch(r"\d{4}-\d{1,2}-\d{1,2}", line):
+        return True
+    return line in {"昨天", "前天"}
+
+
+def format_post_time(post_time: str, reference_time: datetime | None = None) -> str:
+    if not post_time:
+        return ""
+
+    reference_time = reference_time or datetime.now().astimezone()
+    absolute_match = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", post_time)
+    if absolute_match:
+        year, month, day = (int(part) for part in absolute_match.groups())
+        return datetime(year, month, day, tzinfo=reference_time.tzinfo).strftime(OUTPUT_TIME_FORMAT)
+
+    relative_match = re.fullmatch(
+        r"(\d+)\s*(秒|分鐘|小時|天|週|月|年|s|m|h|sec|min|hr|d|w)",
+        post_time,
+        flags=re.IGNORECASE,
+    )
+    if relative_match:
+        amount = int(relative_match.group(1))
+        unit = relative_match.group(2).lower()
+        deltas = {
+            "秒": timedelta(seconds=amount),
+            "s": timedelta(seconds=amount),
+            "sec": timedelta(seconds=amount),
+            "分鐘": timedelta(minutes=amount),
+            "m": timedelta(minutes=amount),
+            "min": timedelta(minutes=amount),
+            "小時": timedelta(hours=amount),
+            "h": timedelta(hours=amount),
+            "hr": timedelta(hours=amount),
+            "天": timedelta(days=amount),
+            "d": timedelta(days=amount),
+            "週": timedelta(weeks=amount),
+            "w": timedelta(weeks=amount),
+            "月": timedelta(days=amount * 30),
+            "年": timedelta(days=amount * 365),
+        }
+        return (reference_time - deltas[unit]).strftime(OUTPUT_TIME_FORMAT)
+
+    if post_time == "昨天":
+        return (reference_time - timedelta(days=1)).strftime(OUTPUT_TIME_FORMAT)
+    if post_time == "前天":
+        return (reference_time - timedelta(days=2)).strftime(OUTPUT_TIME_FORMAT)
+    return post_time
+
+
+def drop_carousel_markers(lines: list[str]) -> list[str]:
+    cleaned = []
+    index = 0
+    while index < len(lines):
+        if (
+            index + 2 < len(lines)
+            and lines[index].isdigit()
+            and lines[index + 1] == "/"
+            and lines[index + 2].isdigit()
+        ):
+            index += 3
+            continue
+        cleaned.append(lines[index])
+        index += 1
+    return cleaned
+
+
+def find_reply_start(lines: list[str], start: int) -> int | None:
+    for index in range(start, len(lines)):
+        line = lines[index]
+        if line.startswith("回覆"):
+            return index + 1
+        if line in {"回覆", "更多回覆"}:
+            return index
+    return None
+
+
+def find_metric_start(lines: list[str], start: int, stop: int) -> int | None:
+    for index in range(start, stop):
+        if looks_like_metric(lines[index]):
+            metric_count = 0
+            for line in lines[index : min(stop, index + 6)]:
+                if looks_like_metric(line):
+                    metric_count += 1
+            if metric_count >= 2:
+                return index
+    return None
+
+
+def find_metric_end(lines: list[str], start: int, stop: int) -> int:
+    index = start
+    while index < stop and looks_like_metric(lines[index]):
+        index += 1
+    return index
+
+
+def trim_ui_lines(lines: list[str]) -> list[str]:
+    return [
+        line
+        for line in lines
+        if line not in {"回覆", "更多回覆", "查看翻譯"} and not line.startswith("回覆")
+    ]
+
+
+def parse_thread_lines(
+    lines: list[str],
+    source_url: str = "",
+    reference_time: datetime | None = None,
+) -> dict:
+    if not lines:
+        return {}
+
+    lines = drop_carousel_markers(lines)
+    author_from_url = extract_author_from_url(source_url)
+
+    view_index = next((index for index, line in enumerate(lines) if looks_like_view_count(line)), None)
+    view_count = format_view_count(lines[view_index]) if view_index is not None else ""
+
+    author_index = None
+    if author_from_url:
+        author_index = next((index for index, line in enumerate(lines) if line == author_from_url), None)
+    if author_index is None:
+        start = (view_index + 1) if view_index is not None else 0
+        author_index = start if start < len(lines) else None
+
+    author = author_from_url or (lines[author_index] if author_index is not None else "")
+
+    post_time = ""
+    time_index = None
+    if author_index is not None:
+        for index in range(author_index + 1, min(len(lines), author_index + 6)):
+            if looks_like_time(lines[index]):
+                post_time = lines[index]
+                time_index = index
+                break
+
+    text_start = (time_index + 1) if time_index is not None else ((author_index + 1) if author_index is not None else 0)
+    reply_start = find_reply_start(lines, text_start)
+    main_stop = reply_start - 1 if reply_start is not None else len(lines)
+    metric_start = find_metric_start(lines, text_start, main_stop)
+    if metric_start is not None:
+        main_stop = metric_start
+
+    main_lines = trim_ui_lines(lines[text_start:main_stop])
+
+    metrics_stop = reply_start - 1 if reply_start is not None else len(lines)
+    metric_source_start = metric_start if metric_start is not None else text_start
+    metric_end = find_metric_end(lines, metric_source_start, metrics_stop)
+    metrics = [
+        line
+        for line in lines[metric_source_start:metric_end]
+        if looks_like_metric(line)
+    ]
+
+    if reply_start is not None:
+        extra_lines = trim_ui_lines(lines[reply_start:])
+    elif metric_start is not None:
+        extra_lines = trim_ui_lines(lines[metric_end:])
+    else:
+        extra_lines = []
+
+    return {
+        "author": author,
+        "post_time": format_post_time(post_time, reference_time),
+        "view_count": view_count,
+        "main_text": "\n".join(main_lines).strip(),
+        "愛心": metrics[0] if len(metrics) > 0 else "",
+        "留言": metrics[1] if len(metrics) > 1 else "",
+        "轉發": metrics[2] if len(metrics) > 2 else "",
+        "分享": "",
+        "related_or_replies": "\n".join(extra_lines).strip(),
+    }
+
+
+def search_url(keyword: str) -> str:
+    return f"https://www.threads.com/search?q={quote(keyword)}"
+
+
+def build_downloaded_post(post: dict) -> dict:
+    scraped_at = datetime.now().astimezone()
+    text = (post.get("text") or "").strip()
+    lines = clean_lines(text)
+    cleaned_text = "\n".join(lines).strip()
+    parsed = parse_thread_lines(
+        lines,
+        source_url=post.get("url", ""),
+        reference_time=scraped_at,
+    )
+    if post.get("view_count"):
+        parsed["view_count"] = post["view_count"]
+    for key, value in (post.get("action_counts") or {}).items():
+        if value:
+            parsed[key] = value
+
+    return {
+        "source_url": post.get("url", ""),
+        "final_url": post.get("final_url", ""),
+        **parsed,
+        "text": cleaned_text or text,
+        "raw_html": post.get("raw_html", post.get("raw_xml", "")),
+        "error": "" if cleaned_text else "No readable public post text found.",
+        "scraped_at": scraped_at.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+
+
+def build_error_post(url: str, error: Exception | str) -> dict:
+    scraped_at = datetime.now().astimezone()
+    return {
+        "source_url": normalize_post_url(url) if url else "",
+        "final_url": "",
+        "author": extract_author_from_url(url),
+        "post_time": "",
+        "view_count": "",
+        "main_text": "",
+        "愛心": "",
+        "留言": "",
+        "轉發": "",
+        "分享": "",
+        "related_or_replies": "",
+        "text": "",
+        "raw_html": "",
+        "error": f"{type(error).__name__}: {error}" if isinstance(error, Exception) else str(error),
+        "scraped_at": scraped_at.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+
+
+def make_browser_openable_html(raw_html: str) -> str:
+    html = raw_html or "<!doctype html><html><body></body></html>"
+    stripped = html.lstrip().lower()
+    if not stripped.startswith("<!doctype") and stripped.startswith("<html"):
+        html = "<!doctype html>\n" + html
+    return html
+
+
+def read_debugger_address(profile_dir: str | Path) -> str | None:
+    devtools_file = Path(profile_dir) / "DevToolsActivePort"
+    if not devtools_file.exists():
+        return None
+
+    lines = devtools_file.read_text(encoding="utf-8").splitlines()
+    if not lines:
+        return None
+    port = lines[0].strip()
+    return f"127.0.0.1:{port}" if port else None
+
+
+def build_driver(
+    headless: bool = False,
+    user_data_dir: str | Path | None = None,
+    debugger_address: str | None = None,
+) -> webdriver.Chrome:
+    options = Options()
+    if headless:
+        options.add_argument("--headless=new")
+
+    if debugger_address:
+        options.debugger_address = debugger_address
+
+    if user_data_dir and not debugger_address:
+        profile_path = Path(user_data_dir).resolve()
+        profile_path.mkdir(parents=True, exist_ok=True)
+        options.add_argument(f"--user-data-dir={profile_path}")
+
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument("--start-maximized")
+    options.add_argument("--lang=zh-TW")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option("useAutomationExtension", False)
+
+    driver = webdriver.Chrome(options=options)
+    stealth(
+        driver,
+        languages=["zh-TW", "zh", "en-US", "en"],
+        vendor="Google Inc.",
+        platform="Win32",
+        webgl_vendor="Intel Inc.",
+        renderer="Intel(R) UHD Graphics",
+        fix_hairline=True,
+    )
+    return driver
+
+
+def start_driver(profile_dir: str | Path) -> webdriver.Chrome:
+    debugger_address = read_debugger_address(profile_dir)
+    if debugger_address:
+        try:
+            print(f"Attaching to existing Chrome: {debugger_address}")
+            return build_driver(headless=False, debugger_address=debugger_address)
+        except WebDriverException:
+            print("Could not attach to existing Chrome. Starting a new Chrome session.")
+
+    return build_driver(headless=False, user_data_dir=profile_dir)
 
 
 def connect_database(db_path: Path) -> sqlite3.Connection:
@@ -189,6 +586,52 @@ def post_time_to_hour(post_time: str) -> str:
             pass
 
     return post_time[:13] if len(post_time) >= 16 and post_time[13] == ":" else post_time
+
+
+def is_chinese_char(char: str) -> bool:
+    return (
+        "\u3400" <= char <= "\u4dbf"
+        or "\u4e00" <= char <= "\u9fff"
+        or "\uf900" <= char <= "\ufaff"
+    )
+
+
+def is_kana_char(char: str) -> bool:
+    return "\u3040" <= char <= "\u30ff"
+
+
+def is_meaningful_char(char: str) -> bool:
+    return char.isalpha() or char.isdigit()
+
+
+def is_chinese_text(text: str) -> bool:
+    if not text:
+        return False
+
+    text = text.replace("翻譯", "")
+    chinese_count = sum(is_chinese_char(char) for char in text)
+    meaningful_count = sum(is_meaningful_char(char) for char in text)
+    kana_count = sum(is_kana_char(char) for char in text)
+
+    if meaningful_count == 0:
+        return False
+
+    chinese_ratio = chinese_count / meaningful_count
+    kana_ratio = kana_count / meaningful_count
+
+    return (
+        chinese_count >= MIN_CHINESE_CHARS
+        and chinese_ratio >= MIN_CHINESE_RATIO
+        and kana_ratio <= MAX_KANA_RATIO
+    )
+
+
+def should_save_downloaded_post(post: dict) -> bool:
+    main_text = post.get("main_text", "") or ""
+    if any(phrase in main_text for phrase in EXCLUDE_PHRASES):
+        return False
+
+    return is_chinese_text(main_text)
 
 
 def save_post(conn: sqlite3.Connection, post: dict) -> int | None:
@@ -619,6 +1062,10 @@ def process_post(
 
     downloaded_post = build_downloaded_post(post)
     downloaded_post["search_keyword"] = post.get("search_word", "")
+    if not should_save_downloaded_post(downloaded_post):
+        downloaded.add(normalize_post_url(url))
+        return
+
     num = save_post(conn, downloaded_post)
     save_raw_html_file(num, downloaded_post.get("raw_html", ""))
     downloaded.add(normalize_post_url(url))
@@ -776,7 +1223,7 @@ def main() -> None:
     load_local_env()
 
     parser = argparse.ArgumentParser(description="Search Threads posts containing seventeen and save them to SQLite.")
-    parser.add_argument("--keyword", default=None, help="Search one keyword only. Default: use SEARCH_WORDS from SEVENETEEN.py")
+    parser.add_argument("--keyword", default=None, help="Search one keyword only. Default: use SEARCH_WORDS from SEVENETEEN_SEARCH_WORDS.py")
     parser.add_argument("--limit", "--max-n", dest="limit", type=int, default=DEFAULT_MAX_N, help=f"Stop when the database reaches N saved posts. Use 0 for no limit. Default: {DEFAULT_MAX_N}")
     parser.add_argument("--profile-dir", default=DEFAULT_PROFILE_DIR, help=f"Chrome profile directory. Default: {DEFAULT_PROFILE_DIR}")
     parser.add_argument("--db-path", default=str(DEFAULT_DB_PATH), help=f"SQLite database path. Default: {DEFAULT_DB_PATH}")
