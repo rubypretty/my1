@@ -401,6 +401,17 @@ def read_debugger_address(profile_dir: str | Path) -> str | None:
     return f"127.0.0.1:{port}" if port else None
 
 
+def remove_stale_debugger_file(profile_dir: str | Path) -> None:
+    devtools_file = Path(profile_dir) / "DevToolsActivePort"
+    if not devtools_file.exists():
+        return
+
+    try:
+        devtools_file.unlink()
+    except OSError as error:
+        print(f"Could not remove stale DevToolsActivePort: {error}")
+
+
 def build_driver(
     headless: bool = False,
     user_data_dir: str | Path | None = None,
@@ -445,6 +456,7 @@ def start_driver(profile_dir: str | Path) -> webdriver.Chrome:
             return build_driver(headless=False, debugger_address=debugger_address)
         except WebDriverException:
             print("Could not attach to existing Chrome. Starting a new Chrome session.")
+            remove_stale_debugger_file(profile_dir)
 
     return build_driver(headless=False, user_data_dir=profile_dir)
 
@@ -845,8 +857,9 @@ def create_driver(profile_dir: str):
     try:
         driver = start_driver(profile_dir)
     except WebDriverException as error:
-        raise SystemExit(
-            "Could not start Chrome with chrome_profile. Close any Chrome window using this profile and try again.\n"
+        raise BrowserRecoveryFailed(
+            "Could not start Chrome with chrome_profile. "
+            "Close any Chrome/ChromeDriver window using this profile and try again.\n"
             f"{error}"
         ) from error
 
@@ -864,6 +877,9 @@ def reset_driver(driver, profile_dir: str):
 
 
 def close_driver(driver) -> None:
+    if driver is None:
+        return
+
     try:
         driver.quit()
     except Exception as error:
@@ -906,6 +922,25 @@ def record_error(
     if notifier is not None:
         notifier.notify("error", info, error=str(error))
         notifier.mark_saved(info)
+
+
+def recover_driver(driver, profile_dir: str, keyword: str, delay: float):
+    last_error = None
+    for attempt in range(1, DRIVER_RESTART_RETRIES + 1):
+        try:
+            print(
+                f"Restarting ChromeDriver for {keyword} "
+                f"({attempt}/{DRIVER_RESTART_RETRIES})."
+            )
+            return reset_driver(driver, profile_dir)
+        except Exception as error:
+            last_error = error
+            driver = None
+            print(f"ChromeDriver restart failed for {keyword}: {error}")
+            time.sleep(delay)
+
+    print(f"Could not restart ChromeDriver for {keyword}. Last error: {last_error}")
+    return None, None
 
 
 def reached_limit(conn: sqlite3.Connection, limit: int) -> bool:
@@ -1152,16 +1187,15 @@ def run_with_driver(
     max_idle_rounds: int,
     notifier: TelegramNotifier,
 ) -> None:
-    driver = create_driver(profile_dir)
+    driver = None
+    search_handle = None
 
     try:
         print(f"Saved posts: {saved_count(conn)}/{limit if limit > 0 else 'unlimited'}")
         downloaded = downloaded_source_urls(conn)
         seen = set(downloaded)
 
-        driver.get("about:blank")
-        search_handle = driver.current_window_handle
-        switch_window(driver, search_handle, "search")
+        driver, search_handle = recover_driver(driver, profile_dir, "initial browser", delay)
 
         for keyword in keywords:
             if reached_limit(conn, limit):
@@ -1173,6 +1207,21 @@ def run_with_driver(
                 attempts += 1
                 mark_keyword_started(conn, keyword)
                 try:
+                    if driver is None or search_handle is None:
+                        driver, search_handle = recover_driver(driver, profile_dir, keyword, delay)
+                        if driver is None or search_handle is None:
+                            error_url = f"https://www.threads.com/search_error/{quote(keyword, safe='')}"
+                            record_error(
+                                conn,
+                                error_url,
+                                "Could not restart ChromeDriver. Skipping this keyword.",
+                                search_keyword=keyword,
+                                notifier=notifier,
+                            )
+                            mark_keyword_completed(conn, keyword)
+                            completed_keyword = True
+                            break
+
                     scrape_keyword(
                         conn,
                         driver,
@@ -1192,26 +1241,27 @@ def run_with_driver(
                             f"Browser session was lost for {keyword}. "
                             f"Restarting ChromeDriver and retrying ({attempts}/{DRIVER_RESTART_RETRIES})."
                         )
-                        try:
-                            driver, search_handle = reset_driver(driver, profile_dir)
-                        except Exception as reset_error:
-                            if attempts >= DRIVER_RESTART_RETRIES:
-                                raise BrowserRecoveryFailed(
-                                    f"Could not restart ChromeDriver for {keyword}. Last error: {reset_error}"
-                                ) from reset_error
-                            print(f"ChromeDriver restart failed for {keyword}: {reset_error}")
-                            time.sleep(delay)
+                        driver, search_handle = recover_driver(driver, profile_dir, keyword, delay)
                         continue
 
                     if is_browser_connection_error(error):
-                        raise BrowserRecoveryFailed(
+                        error_message = (
                             f"Browser session kept failing for {keyword} after "
                             f"{DRIVER_RESTART_RETRIES} restart attempts. Last error: {error}"
-                        ) from error
+                        )
+                        print(error_message)
+                        error_url = f"https://www.threads.com/search_error/{quote(keyword, safe='')}"
+                        record_error(conn, error_url, error_message, search_keyword=keyword, notifier=notifier)
+                        driver, search_handle = recover_driver(driver, profile_dir, keyword, delay)
+                        mark_keyword_completed(conn, keyword)
+                        completed_keyword = True
+                        break
 
                     print(f"Keyword failed: {keyword}: {error}")
                     error_url = f"https://www.threads.com/search_error/{quote(keyword, safe='')}"
                     record_error(conn, error_url, error, search_keyword=keyword, notifier=notifier)
+                    driver, search_handle = recover_driver(driver, profile_dir, keyword, delay)
+                    mark_keyword_completed(conn, keyword)
                     completed_keyword = True
 
                 mark_keyword_completed(conn, keyword)

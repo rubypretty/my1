@@ -9,9 +9,9 @@ from collections import Counter
 from pathlib import Path
 
 
-SOURCE_DB = Path("seventeen_clean.sqlite3")
-OUTPUT_IMAGE = Path("seventeen_wordcloud_notall.png")
-OUTPUT_TOP_WORDS = Path("seventeen_wordcloud_notall_top_words.csv")
+SOURCE_DB = Path("seventeen_clean_zh.sqlite3")
+OUTPUT_IMAGE = Path("seventeen_wordcloud_notall_zh.png")
+OUTPUT_TOP_WORDS = Path("seventeen_wordcloud_notall_zh_top_words.csv")
 
 IMAGE_WIDTH = 1800
 IMAGE_HEIGHT = 1200
@@ -256,8 +256,25 @@ def is_emoji_char(char: str) -> bool:
     )
 
 
+def is_emoji_modifier_char(char: str) -> bool:
+    return 0x1F3FB <= ord(char) <= 0x1F3FF
+
+
+def is_emoji_connector_char(char: str) -> bool:
+    code = ord(char)
+    return code == 0x200D or 0xFE00 <= code <= 0xFE0F or is_emoji_modifier_char(char)
+
+
+def has_base_emoji(token: str) -> bool:
+    return any(is_emoji_char(char) and not is_emoji_connector_char(char) for char in token)
+
+
 def is_invisible_joiner_or_selector(token: str) -> bool:
-    return all(ord(char) == 0x200D or 0xFE00 <= ord(char) <= 0xFE0F for char in token)
+    return all(is_emoji_connector_char(char) for char in token)
+
+
+def is_object_replacement_token(token: str) -> bool:
+    return all(char == "\ufffc" for char in token)
 
 
 def tokenize_text(text: str) -> list[str]:
@@ -289,9 +306,16 @@ def tokenize_non_hashtag_text(text: str) -> list[str]:
 def merge_emoji_selectors(tokens: list[str]) -> list[str]:
     merged = []
     for token in tokens:
-        if is_invisible_joiner_or_selector(token) and merged:
-            merged[-1] += token
-        else:
+        if is_object_replacement_token(token):
+            continue
+
+        if is_invisible_joiner_or_selector(token):
+            if merged and has_base_emoji(merged[-1]):
+                merged[-1] += token
+            continue
+
+        token = token.replace("\ufffc", "")
+        if token:
             merged.append(token)
     return merged
 
@@ -357,6 +381,10 @@ class FontManager:
 
         return self.get_font(self.font_paths[0], size)
 
+    def supports_char(self, char: str) -> bool:
+        codepoint = ord(char)
+        return any(codepoint in codepoints for codepoints in self.supported_codepoints.values())
+
     def get_font(self, path: Path, size: int):
         from PIL import ImageFont
 
@@ -385,6 +413,19 @@ def split_font_runs(token: str, size: int, font_manager: FontManager):
         runs.append(("".join(current_text), current_font))
 
     return runs
+
+
+def drawable_token(token: str, font_manager: FontManager) -> str:
+    chars = []
+    for char in token:
+        if char == "\ufffc":
+            continue
+        if is_emoji_connector_char(char) and not chars:
+            continue
+        if font_manager.supports_char(char):
+            chars.append(char)
+
+    return "".join(chars).strip()
 
 
 def text_size(token: str, size: int, font_manager: FontManager) -> tuple[int, int]:
@@ -479,7 +520,11 @@ def make_word_cloud(frequencies: Counter) -> int:
     for token, count in top_words:
         size = token_font_size(count, max_count)
         color = rng.choice(PALETTE)
-        token_image = make_token_image(token, size, color, font_manager)
+        display_token = drawable_token(token, font_manager)
+        if not display_token:
+            continue
+
+        token_image = make_token_image(display_token, size, color, font_manager)
 
         if rng.random() > 0.86 and token_image.width < 380:
             token_image = token_image.rotate(90, expand=True, resample=Image.Resampling.BICUBIC)
